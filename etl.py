@@ -1,187 +1,146 @@
-"""Movie ETL pipeline: MovieLens CSVs + OMDb API -> SQLite."""
+"""Movie ETL pipeline: MovieLens CSVs + OMDb API -> SQLite database.
+
+1) Extract   - read the CSV files, ask the OMDb API for extra movie details
+2) Transform - clean titles, genres, ratings and API values (with pandas)
+3) Load      - save everything in SQLite (safe to run many times)
+"""
 import json
-import logging
 import os
 import re
 import sqlite3
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
-try:  # optional: load OMDB_API_KEY from a .env file if python-dotenv is installed
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
+load_dotenv()  # reads OMDB_API_KEY from the .env file
 API_KEY = os.getenv("OMDB_API_KEY")
-CACHE_FILE = os.getenv("OMDB_CACHE", "omdb_cache.json")
-DB_FILE = os.getenv("DB_FILE", "movies.db")
-DATA_DIR = os.getenv("DATA_DIR", "data")
-MAX_CALLS = int(os.getenv("OMDB_MAX_CALLS", "950"))  # free key allows ~1000/day
-calls_made = 0
-limit_reached = False  # set when OMDb reports the daily limit
+MAX_CALLS = int(os.getenv("OMDB_MAX_CALLS", "950"))  # free key allows ~1000 calls per day
+CACHE_FILE = "omdb_cache.json"  # remembers every API answer, so reruns cost nothing
+DB_FILE = "movies.db"
 
 
-class ApiLimit(Exception):
-    """Raised when we should stop calling the API for this run."""
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-log = logging.getLogger("etl")
-
-
-# ---------- helpers ----------
-def parse_title(raw):
-    """'Matrix, The (1999)' -> ('The Matrix', 1999)."""
-    m = re.match(r"^(.*)\s\((\d{4})\)\s*$", raw)
-    title, year = (m.group(1).strip(), int(m.group(2))) if m else (raw.strip(), None)
-    m2 = re.match(r"^(.*), (The|A|An)$", title)
-    if m2:
-        title = f"{m2.group(2)} {m2.group(1)}"
+# ---------- small helper functions ----------
+def split_title(raw):
+    """'Matrix, The (1999)' -> ('The Matrix', 1999)"""
+    match = re.match(r"^(.*)\s\((\d{4})\)\s*$", raw)
+    title, year = (match.group(1).strip(), int(match.group(2))) if match else (raw.strip(), None)
+    match = re.match(r"^(.*), (The|A|An)$", title)
+    if match:
+        title = f"{match.group(2)} {match.group(1)}"
     return title, year
 
 
-def na_to_none(v):
-    return None if v in (None, "", "N/A") else v
-
-
-def clean_box_office(v):
-    if not v or v == "N/A":
-        return None
-    digits = re.sub(r"[^\d]", "", v)
-    return int(digits) if digits else None
-
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_cache(cache):
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache, f)
-
-
-def fetch_omdb(title, year, cache):
-    global calls_made, limit_reached
-    key = f"{title}|{year}"
-    if key in cache:
-        return cache[key]
-    if limit_reached or calls_made >= MAX_CALLS:
-        raise ApiLimit  # no new API calls, cached data is still used
-    calls_made += 1
-    params = {"apikey": API_KEY, "t": title}
-    if year:
-        params["y"] = year
+def call_omdb(title, year):
+    """Ask OMDb about one movie. Returns its JSON answer, or None if the call failed."""
+    params = {"apikey": API_KEY, "t": title, "y": year}  # year=None is skipped automatically
     try:
-        data = requests.get("http://www.omdbapi.com/", params=params, timeout=10).json()
+        return requests.get("http://www.omdbapi.com/", params=params, timeout=10).json()
     except (requests.RequestException, ValueError):
-        return None  # transient error: not cached, retried next run
-    if data.get("Error") == "Request limit reached!":
-        limit_reached = True
-        raise ApiLimit
-    cache[key] = data
-    return data
+        return None
 
 
-# ---------- extract / transform ----------
-def extract():
-    movies = pd.read_csv(os.path.join(DATA_DIR, "movies.csv"))
-    ratings = pd.read_csv(os.path.join(DATA_DIR, "ratings.csv"))
-    return movies, ratings
+def get_api_data(movies, cache):
+    """Return {movie_id: OMDb answer} for the movies OMDb knows.
+    Looks in the cache first and only calls the API for new movies."""
+    answers = {}
+    calls_left = MAX_CALLS
+    for row in movies.itertuples():
+        year = None if pd.isna(row.release_year) else int(row.release_year)
+        key = f"{row.title}|{year}"
+        if key not in cache and calls_left > 0:
+            calls_left -= 1
+            data = call_omdb(row.title, year)
+            error = (data or {}).get("Error", "")
+            if "API key" in error:  # wrong or missing key: stop right away
+                raise SystemExit(f"OMDb rejected the API key ({error}). Check OMDB_API_KEY in .env")
+            if error == "Request limit reached!":  # daily limit used up: no more calls today
+                calls_left = 0
+            elif data and (data.get("Response") == "True" or error == "Movie not found!"):
+                cache[key] = data  # save real answers and genuine "not found"; never save errors
+        data = cache.get(key)
+        if data and data.get("Response") == "True":
+            answers[int(row.movieId)] = data
+    return answers
 
 
-def transform(movies, ratings, cache):
-    parsed = movies["title"].apply(parse_title)
-    movies = movies.copy()
-    movies["clean_title"] = parsed.str[0]
-    movies["release_year"] = parsed.str[1].astype("Int64")
-    movies["decade"] = (movies["release_year"] // 10 * 10).astype("Int64")
-
-    # Most-rated movies first, so a limited API quota covers the movies that matter most
-    counts = ratings["movieId"].value_counts()
-    order = sorted(movies["movieId"], key=lambda m: -counts.get(m, 0))
-    by_id = movies.set_index("movieId")
-    api, found, limit_hit = {}, 0, False
-    for mid in order:
-        r = by_id.loc[mid]
-        year = None if pd.isna(r["release_year"]) else int(r["release_year"])
-        try:
-            d = fetch_omdb(r["clean_title"], year, cache)  # cache first, API only if allowed
-        except ApiLimit:
-            d = None
-            if not limit_hit:
-                limit_hit = True
-                log.warning("API limit reached. Movies without cached data are loaded without API data; rerun later.")
-        if d and d.get("Response") == "True":
-            found += 1
-            api[mid] = (na_to_none(d.get("imdbID")), na_to_none(d.get("Director")),
-                        na_to_none(d.get("Plot")), clean_box_office(d.get("BoxOffice")), 1)
-        else:
-            api[mid] = (None, None, None, None, 0)
-    log.info("API data found for %d of %d movies", found, len(movies))
-    movies[["imdb_id", "director", "plot", "box_office", "omdb_found"]] = pd.DataFrame(
-        movies["movieId"].map(api).tolist(), index=movies.index)
-
-    # genres
-    g = movies[["movieId", "genres"]].copy()
-    g["genre"] = g["genres"].str.split("|")
-    g = g.explode("genre")
-    g = g[g["genre"].notna() & (g["genre"] != "(no genres listed)")]
-    movie_genres = g[["movieId", "genre"]].drop_duplicates()
-
-    # ratings
-    ratings = ratings.drop_duplicates(subset=["userId", "movieId"]).dropna(subset=["rating"])
-    ratings = ratings[ratings["movieId"].isin(movies["movieId"])].copy()
-    ratings["rated_at"] = pd.to_datetime(ratings["timestamp"], unit="s").dt.strftime("%Y-%m-%d %H:%M:%S")
-    return movies, movie_genres, ratings
+def to_rows(df):
+    """DataFrame -> list of tuples for SQLite. Missing values (NaN) become None (NULL)."""
+    return list(df.astype(object).where(df.notna(), None).itertuples(index=False, name=None))
 
 
-# ---------- load ----------
-def nn(v):
-    return None if pd.isna(v) else v
-
-
-def load(conn, movies, movie_genres, ratings):
-    with conn:
-        conn.executemany("""
-            INSERT INTO movies (movie_id,title,release_year,decade,imdb_id,director,plot,box_office,omdb_found)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(movie_id) DO UPDATE SET
-            title=excluded.title, release_year=excluded.release_year, decade=excluded.decade,
-            imdb_id=excluded.imdb_id, director=excluded.director, plot=excluded.plot,
-            box_office=excluded.box_office, omdb_found=excluded.omdb_found
-        """, [(int(r.movieId), r.clean_title,
-            None if pd.isna(r.release_year) else int(r.release_year),
-            None if pd.isna(r.decade) else int(r.decade),
-            nn(r.imdb_id), nn(r.director), nn(r.plot),
-            None if pd.isna(r.box_office) else int(r.box_office), int(r.omdb_found))
-            for r in movies.itertuples()])
-        conn.executemany("INSERT OR IGNORE INTO genres(name) VALUES (?)",
-                        [(g,) for g in movie_genres["genre"].unique()])
-        ids = dict(conn.execute("SELECT name, genre_id FROM genres"))
-        conn.executemany("INSERT OR IGNORE INTO movie_genres VALUES (?,?)",
-                        [(int(r.movieId), ids[r.genre]) for r in movie_genres.itertuples()])
-        conn.executemany("INSERT OR IGNORE INTO ratings VALUES (?,?,?,?)",
-                        [(int(r.userId), int(r.movieId), float(r.rating), r.rated_at)
-                        for r in ratings.itertuples()])
-
-
+# ---------- the pipeline ----------
 def main():
-    conn = sqlite3.connect(DB_FILE)
-    with open("schema.sql") as f:
-        conn.executescript(f.read())
-    cache = load_cache()
+    # ===== EXTRACT =====
+    movies = pd.read_csv("data/movies.csv")
+    ratings = pd.read_csv("data/ratings.csv")
+
+    # ===== TRANSFORM: movies =====
+    parts = movies["title"].apply(split_title)  # one (title, year) pair per movie
+    movies["title"] = parts.str[0]
+    movies["release_year"] = parts.str[1].astype("Int64")  # Int64 allows missing years
+    movies["decade"] = movies["release_year"] // 10 * 10  # feature engineering: 1999 -> 1990
+
+    # Ask the API about the most-rated movies first, because the daily limit is small
+    n_ratings = movies["movieId"].map(ratings["movieId"].value_counts()).fillna(0)
+    most_rated_first = movies.loc[(-n_ratings).sort_values(kind="stable").index]
+    cache = json.load(open(CACHE_FILE)) if os.path.exists(CACHE_FILE) else {}
     try:
-        movies, ratings = extract()
-        movies, movie_genres, ratings = transform(movies, ratings, cache)
+        answers = get_api_data(most_rated_first, cache)
     finally:
-        save_cache(cache)
-    load(conn, movies, movie_genres, ratings)
-    for t in ("movies", "genres", "movie_genres", "ratings"):
-        log.info("%s: %d rows", t, conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+        json.dump(cache, open(CACHE_FILE, "w"))  # always save, even if the script stops early
+    print(f"API data found for {len(answers)} of {len(movies)} movies "
+        f"(run again tomorrow to fetch more)")
+
+    # Enrich: add the API details as new columns (movies OMDb doesn't know get NULLs)
+    columns = ["imdbID", "Director", "Plot", "BoxOffice"]
+    details = pd.DataFrame.from_dict(answers, orient="index", columns=columns)
+    details = details.mask(details == "N/A")  # OMDb writes "N/A" for missing data
+    movies = movies.join(details, on="movieId").rename(
+        columns={"imdbID": "imdb_id", "Director": "director", "Plot": "plot"})
+    # "$191,796,233" -> 191796233
+    movies["box_office"] = pd.to_numeric(
+        movies["BoxOffice"].str.replace(r"\D", "", regex=True), errors="coerce").astype("Int64")
+    movies["omdb_found"] = movies["movieId"].isin(list(answers)).astype(int)
+
+    # ===== TRANSFORM: genres ("Action|Comedy" -> one row per genre) =====
+    movie_genres = movies.assign(genre=movies["genres"].str.split("|")).explode("genre")
+    movie_genres = movie_genres[movie_genres["genre"] != "(no genres listed)"]
+    movie_genres = movie_genres[["movieId", "genre"]].drop_duplicates()
+
+    # ===== TRANSFORM: ratings =====
+    ratings = ratings.drop_duplicates(subset=["userId", "movieId"]).dropna(subset=["rating"])
+    ratings = ratings[ratings["movieId"].isin(movies["movieId"])].copy()  # drop unknown movies
+    ratings["rated_at"] = pd.to_datetime(ratings["timestamp"], unit="s").dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ===== LOAD =====
+    conn = sqlite3.connect(DB_FILE)
+    conn.executescript(open("schema.sql").read())  # creates the tables if they don't exist
+    with conn:  # one transaction: everything is saved, or nothing is
+        # Upsert: a new movie is inserted, an existing one is updated (no duplicates)
+        conn.executemany("""
+            INSERT INTO movies (movie_id, title, release_year, decade, imdb_id,
+                                director, plot, box_office, omdb_found)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(movie_id) DO UPDATE SET
+                title=excluded.title, release_year=excluded.release_year,
+                decade=excluded.decade, imdb_id=excluded.imdb_id,
+                director=excluded.director, plot=excluded.plot,
+                box_office=excluded.box_office, omdb_found=excluded.omdb_found
+        """, to_rows(movies[["movieId", "title", "release_year", "decade", "imdb_id",
+                            "director", "plot", "box_office", "omdb_found"]]))
+
+        # INSERT OR IGNORE skips rows that already exist, so reruns add no duplicates
+        conn.executemany("INSERT OR IGNORE INTO genres (name) VALUES (?)",
+                        [(g,) for g in movie_genres["genre"].unique()])
+        genre_ids = dict(conn.execute("SELECT name, genre_id FROM genres"))
+        conn.executemany("INSERT OR IGNORE INTO movie_genres VALUES (?, ?)",
+                        [(m, genre_ids[g]) for m, g in to_rows(movie_genres)])
+        conn.executemany("INSERT OR IGNORE INTO ratings VALUES (?, ?, ?, ?)",
+                        to_rows(ratings[["userId", "movieId", "rating", "rated_at"]]))
+
+    for table in ("movies", "genres", "movie_genres", "ratings"):
+        print(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], "rows")
     conn.close()
 
 
